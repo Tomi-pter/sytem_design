@@ -1,0 +1,6 @@
+{"index":1,"term":10378,"op":"PUT","key":"mykey","value":"hello"}
+{"index":2,"term":10378,"op":"PUT","key":"yourkey","value":"hiya"}
+{"index":3,"term":10378,"op":"DELETE","key":"mykey","value":""}
+{"index":4,"term":10378,"op":"PUT","key":"mykey","value":"3"}
+{"index":5,"term":10378,"op":"DELETE","key":"mykey","value":""}
+{"index":6,"term":10378,"op":"DELETE","key":"mykey","value":""}
