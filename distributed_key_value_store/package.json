@@ -1,0 +1,22 @@
+{
+  "name": "distributed-key-value-store",
+  "version": "1.0.0",
+  "description": "Raft-based distributed key-value store",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.5.3"
+  }
+}
