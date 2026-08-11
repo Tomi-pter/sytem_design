@@ -253,3 +253,408 @@ function proxyToLeader(req: express.Request, res: express.Response) {
   }
   proxyReq.end();
 }
+
+app.get("/store/:key", (req, res) => {
+  if (!isLeaderHealthy()) {
+    if (!isLeader()) {
+      return proxyToLeader(req, res);
+    }
+    return res.status(503).json({ error: "Leader cannot confirm majority" });
+  }
+
+  const key = req.params.key;
+  if (stateMachine.has(key)) {
+    return res.status(200).json({ [key]: stateMachine.get(key) });
+  }
+  return res.status(404).json({ error: "Not Found" });
+});
+
+app.put("/store/:key", async (req, res) => {
+  if (!isLeaderHealthy()) {
+    if (!isLeader()) {
+      return proxyToLeader(req, res);
+    }
+    return res.status(503).json({ error: "Leader cannot confirm majority" });
+  }
+
+  const key = req.params.key;
+  const value = req.body?.[key];
+
+  if (typeof value !== "string") {
+    return res
+      .status(400)
+      .json({ error: `Body must contain a string value for key "${key}"` });
+  }
+
+  const entry: LogEntry = {
+    index: getLastLogIndex() + 1,
+    term: currentTerm,
+    op: "PUT",
+    key,
+    value,
+  };
+  appendWal(entry);
+  logEntries.push(entry);
+
+  const success = await replicateLog(entry.index);
+  if (!success) {
+    return res.status(503).json({ error: "Failed to replicate to majority" });
+  }
+
+  commitIndex = Math.max(commitIndex, entry.index);
+  applyLogToStateMachine();
+  return res.status(200).json({ status: "OK" });
+});
+
+app.delete("/store/:key", async (req, res) => {
+  if (!isLeaderHealthy()) {
+    if (!isLeader()) {
+      return proxyToLeader(req, res);
+    }
+    return res.status(503).json({ error: "Leader cannot confirm majority" });
+  }
+
+  const key = req.params.key;
+  const entry: LogEntry = {
+    index: getLastLogIndex() + 1,
+    term: currentTerm,
+    op: "DELETE",
+    key,
+    value: "",
+  };
+  appendWal(entry);
+  logEntries.push(entry);
+
+  const success = await replicateLog(entry.index);
+  if (!success) {
+    return res.status(503).json({ error: "Failed to replicate to majority" });
+  }
+
+  commitIndex = Math.max(commitIndex, entry.index);
+  applyLogToStateMachine();
+  return res.status(200).json({ status: "OK" });
+});
+
+app.get("/health", (req, res) => {
+  return res.status(200).json({
+    status: isLeaderHealthy() ? "healthy" : "degraded",
+    nodes: clusterSize(),
+    role: role.toLowerCase(),
+    leader: leaderId,
+    term: currentTerm,
+    commitIndex,
+    lastApplied,
+  });
+});
+
+function requestVote(call: any, callback: any) {
+  const req = call.request as VoteRequestPayload;
+  if (req.term < currentTerm) {
+    return callback(null, { term: currentTerm, voteGranted: false });
+  }
+
+  if (req.term > currentTerm) {
+    currentTerm = req.term;
+    role = "FOLLOWER";
+    votedFor = null;
+    leaderId = null;
+    saveMetadata();
+  }
+
+  const candidateUpToDate =
+    req.lastLogTerm > getLastLogTerm() ||
+    (req.lastLogTerm === getLastLogTerm() &&
+      req.lastLogIndex >= getLastLogIndex());
+
+  if (
+    (votedFor === null || votedFor === req.candidateId) &&
+    candidateUpToDate
+  ) {
+    votedFor = req.candidateId;
+    lastHeartbeat = Date.now();
+    saveMetadata();
+    return callback(null, { term: currentTerm, voteGranted: true });
+  }
+
+  return callback(null, { term: currentTerm, voteGranted: false });
+}
+
+function appendEntries(call: any, callback: any) {
+  const req = call.request as AppendEntriesRequestPayload;
+  if (req.term < currentTerm) {
+    return callback(null, {
+      term: currentTerm,
+      success: false,
+      matchIndex: 0,
+      conflictTerm: 0,
+      conflictIndex: 0,
+    });
+  }
+
+  if (req.term > currentTerm) {
+    currentTerm = req.term;
+    role = "FOLLOWER";
+    votedFor = null;
+    leaderId = req.leaderId;
+    saveMetadata();
+  } else {
+    leaderId = req.leaderId;
+  }
+
+  lastHeartbeat = Date.now();
+
+  if (req.prevLogIndex > 0) {
+    const prevLogEntry = logEntries[req.prevLogIndex - 1];
+    if (!prevLogEntry || prevLogEntry.term !== req.prevLogTerm) {
+      const conflictTerm = prevLogEntry?.term ?? 0;
+      const conflictIndex = prevLogEntry
+        ? findFirstIndexOfTerm(conflictTerm)
+        : req.prevLogIndex;
+      return callback(null, {
+        term: currentTerm,
+        success: false,
+        matchIndex: 0,
+        conflictTerm,
+        conflictIndex,
+      });
+    }
+  }
+
+  let index = req.prevLogIndex;
+  for (const entry of req.entries) {
+    index += 1;
+    if (logEntries[index - 1]?.term !== entry.term) {
+      logEntries = logEntries.slice(0, index - 1);
+      logEntries.push(entry);
+      appendWal(entry);
+    }
+  }
+
+  if (req.leaderCommit > commitIndex) {
+    commitIndex = Math.min(req.leaderCommit, getLastLogIndex());
+    applyLogToStateMachine();
+  }
+
+  return callback(null, {
+    term: currentTerm,
+    success: true,
+    matchIndex: getLastLogIndex(),
+    conflictTerm: 0,
+    conflictIndex: 0,
+  });
+}
+
+function findFirstIndexOfTerm(term: number) {
+  for (let i = 0; i < logEntries.length; i += 1) {
+    if (logEntries[i].term === term) return i + 1;
+  }
+  return 1;
+}
+
+function startElection() {
+  if (role === "LEADER") return;
+
+  role = "CANDIDATE";
+  currentTerm += 1;
+  votedFor = NODE_ID;
+  leaderId = null;
+  saveMetadata();
+  const votesNeeded = quorumSize();
+  let votes = 1;
+  lastHeartbeat = Date.now();
+
+  PEERS.forEach((peer) => {
+    const client = createRaftClient(peer.grpcAddress);
+    const request: VoteRequestPayload = {
+      term: currentTerm,
+      candidateId: NODE_ID,
+      lastLogIndex: getLastLogIndex(),
+      lastLogTerm: getLastLogTerm(),
+    };
+    client.RequestVote(request, (err: any, response: VoteResponsePayload) => {
+      if (role !== "CANDIDATE") return;
+      if (err) return;
+      if (response.term > currentTerm) {
+        currentTerm = response.term;
+        role = "FOLLOWER";
+        votedFor = null;
+        leaderId = null;
+        saveMetadata();
+        return;
+      }
+      if (response.voteGranted) {
+        votes += 1;
+        if (votes >= votesNeeded) {
+          role = "LEADER";
+          leaderId = NODE_ID;
+          lastLeaderAck = Date.now();
+          initializeLeaderState();
+          broadcastHeartbeats();
+        }
+      }
+    });
+  });
+}
+
+function initializeLeaderState() {
+  for (const peer of PEERS) {
+    nextIndex[peer.id] = getLastLogIndex() + 1;
+    matchIndex[peer.id] = 0;
+  }
+}
+
+function sendAppendEntriesToPeer(peer: PeerConfig) {
+  return new Promise<AppendEntriesResponsePayload>((resolve, reject) => {
+    const next = Math.max(1, nextIndex[peer.id] ?? getLastLogIndex() + 1);
+    const prevLogIndex = next - 1;
+    const prevLogTerm =
+      prevLogIndex === 0 ? 0 : (logEntries[prevLogIndex - 1]?.term ?? 0);
+    const entries = logEntries.slice(prevLogIndex);
+    const request: AppendEntriesRequestPayload = {
+      term: currentTerm,
+      leaderId: NODE_ID,
+      prevLogIndex,
+      prevLogTerm,
+      entries,
+      leaderCommit: commitIndex,
+    };
+    const client = createRaftClient(peer.grpcAddress);
+    client.AppendEntries(
+      request,
+      (err: any, response: AppendEntriesResponsePayload) => {
+        if (err) {
+          return reject(err);
+        }
+        resolve(response);
+      },
+    );
+  });
+}
+
+async function replicateLog(targetIndex: number) {
+  let successCount = 1;
+  const responses = await Promise.allSettled(
+    PEERS.map((peer) => sendAppendEntriesToPeer(peer)),
+  );
+
+  responses.forEach((result, index) => {
+    const peer = PEERS[index];
+    if (result.status === "fulfilled") {
+      const response = result.value;
+      if (response.term > currentTerm) {
+        currentTerm = response.term;
+        role = "FOLLOWER";
+        votedFor = null;
+        leaderId = null;
+        saveMetadata();
+        return;
+      }
+      if (response.success) {
+        successCount += 1;
+        nextIndex[peer.id] = Math.max(
+          nextIndex[peer.id] ?? 1,
+          response.matchIndex + 1,
+        );
+        matchIndex[peer.id] = Math.max(
+          matchIndex[peer.id] ?? 0,
+          response.matchIndex,
+        );
+      } else {
+        nextIndex[peer.id] = Math.max(1, response.conflictIndex);
+      }
+    }
+  });
+
+  if (successCount >= quorumSize()) {
+    lastLeaderAck = Date.now();
+    return true;
+  }
+  return false;
+}
+
+function broadcastHeartbeats() {
+  if (role !== "LEADER") return;
+
+  Promise.allSettled(PEERS.map((peer) => sendAppendEntriesToPeer(peer))).then(
+    (results) => {
+      let successCount = 1;
+      for (let i = 0; i < results.length; i += 1) {
+        const result = results[i];
+        const peer = PEERS[i];
+        if (result.status !== "fulfilled") continue;
+        const response = result.value;
+        if (response.term > currentTerm) {
+          currentTerm = response.term;
+          role = "FOLLOWER";
+          votedFor = null;
+          leaderId = null;
+          saveMetadata();
+          return;
+        }
+        if (response.success) {
+          successCount += 1;
+          nextIndex[peer.id] = Math.max(
+            nextIndex[peer.id] ?? 1,
+            response.matchIndex + 1,
+          );
+          matchIndex[peer.id] = Math.max(
+            matchIndex[peer.id] ?? 0,
+            response.matchIndex,
+          );
+        } else {
+          nextIndex[peer.id] = Math.max(1, response.conflictIndex);
+        }
+      }
+      if (successCount >= quorumSize()) {
+        lastLeaderAck = Date.now();
+      }
+    },
+  );
+}
+
+function beginElection() {
+  if (role === "LEADER") return;
+  if (Date.now() - lastHeartbeat <= electionTimeoutMs) return;
+  electionTimeoutMs = randomElectionTimeout();
+  startElection();
+}
+
+function startServer() {
+  safeDir(DATA_DIR);
+  loadMetadata();
+  loadWal();
+  commitIndex = getLastLogIndex();
+  applyLogToStateMachine();
+
+  const server = new grpc.Server();
+  server.addService(raftProto.raftkv.RaftInternal.service, {
+    RequestVote: requestVote,
+    AppendEntries: appendEntries,
+  });
+
+  server.bindAsync(
+    `0.0.0.0:${GRPC_PORT}`,
+    grpc.ServerCredentials.createInsecure(),
+    (err, port) => {
+      if (err) {
+        console.error("gRPC bind failed", err);
+        process.exit(1);
+      }
+      server.start();
+      console.log(`gRPC listening on ${port}`);
+    },
+  );
+
+  app.listen(PUBLIC_PORT, () => {
+    console.log(`HTTP listening on ${PUBLIC_PORT}`);
+  });
+
+  setInterval(() => {
+    if (role === "LEADER") {
+      broadcastHeartbeats();
+    }
+    beginElection();
+  }, heartbeatIntervalMs);
+}
+
+startServer();
